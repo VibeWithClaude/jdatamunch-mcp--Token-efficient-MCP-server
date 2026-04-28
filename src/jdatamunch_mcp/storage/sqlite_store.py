@@ -78,7 +78,10 @@ def create_table(
 
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        # MEMORY journal during write phase → no -wal/-shm sidecars to
+        # complicate the atomic tmp→final rename on Windows. The tmp file is
+        # disposable on crash anyway (A4 invariant).
+        conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("DROP TABLE IF EXISTS rows")
         conn.execute(ddl)
@@ -154,9 +157,10 @@ class BulkInserter:
 
     def __enter__(self) -> "BulkInserter":
         self._conn = sqlite3.connect(str(self.sqlite_path))
-        # WAL + synchronous=NORMAL: durable enough that a kill mid-load
-        # leaves either a complete batch or a recoverable journal (A4).
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode=MEMORY: no on-disk -wal/-shm sidecars, so the
+        # subsequent tmp→final atomic rename is clean on Windows. Crash-safety
+        # comes from the tmp+rename invariant, not from this connection.
+        self._conn.execute("PRAGMA journal_mode=MEMORY")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA cache_size=-131072")   # 128 MB page cache
         self._conn.execute("PRAGMA temp_store=MEMORY")
@@ -215,7 +219,8 @@ def create_indexes(
     """
     conn = sqlite3.connect(str(sqlite_path))
     try:
-        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA cache_size=-131072")
         conn.execute("PRAGMA temp_store=MEMORY")
         for p in profiles:
@@ -303,6 +308,57 @@ def _build_where(filters: list, schema_columns: list) -> tuple:
     return " AND ".join(clauses), params
 
 
+def _build_having(having: list, alias_to_expr: dict) -> tuple:
+    """Build a parameterized HAVING clause referencing aggregation aliases (B11).
+
+    `alias_to_expr` maps each alias to its underlying aggregate SQL expression.
+    The expression is substituted directly into HAVING so it remains correct
+    even when the alias name collides with a source column.
+
+    Operators allowed: eq, neq, gt, gte, lt, lte, in, between, is_null.
+    """
+    if not having:
+        return "", []
+    clauses: list = []
+    params: list = []
+    for f in having:
+        col = f.get("column", "")
+        op = f.get("op", "")
+        val = f.get("value")
+        if col not in alias_to_expr:
+            raise ValueError(
+                f"INVALID_HAVING: column {col!r} is not an aggregation alias. "
+                f"Available aliases: {sorted(alias_to_expr)}"
+            )
+        qc = alias_to_expr[col]  # raw aggregate expression, e.g. COUNT(*)
+        if op == "eq":
+            clauses.append(f"{qc} = ?"); params.append(val)
+        elif op == "neq":
+            clauses.append(f"{qc} != ?"); params.append(val)
+        elif op == "gt":
+            clauses.append(f"{qc} > ?"); params.append(val)
+        elif op == "gte":
+            clauses.append(f"{qc} >= ?"); params.append(val)
+        elif op == "lt":
+            clauses.append(f"{qc} < ?"); params.append(val)
+        elif op == "lte":
+            clauses.append(f"{qc} <= ?"); params.append(val)
+        elif op == "in":
+            if not isinstance(val, list) or not val:
+                raise ValueError("INVALID_HAVING: 'in' requires a non-empty list value")
+            ph = ",".join("?" * len(val))
+            clauses.append(f"{qc} IN ({ph})"); params.extend(val)
+        elif op == "between":
+            if not isinstance(val, list) or len(val) != 2:
+                raise ValueError("INVALID_HAVING: 'between' requires [min, max] list")
+            clauses.append(f"{qc} BETWEEN ? AND ?"); params.extend(val)
+        elif op == "is_null":
+            clauses.append(f"{qc} IS NULL" if val else f"{qc} IS NOT NULL")
+        else:
+            raise ValueError(f"INVALID_HAVING: unsupported operator {op!r}")
+    return " AND ".join(clauses), params
+
+
 def query_rows(
     sqlite_path: Path,
     schema_columns: list,   # list of column dicts from DataIndex
@@ -370,6 +426,7 @@ def query_aggregate(
     group_by: Optional[list] = None,
     aggregations: Optional[list] = None,
     filters: Optional[list] = None,
+    having: Optional[list] = None,
     order_by: Optional[str] = None,
     order_dir: str = "desc",
     limit: int = 50,
@@ -377,6 +434,8 @@ def query_aggregate(
     """Execute a GROUP BY aggregation query.
 
     aggregations: list of {"column": ..., "function": ..., "alias": ...}
+    having: list of filter dicts whose `column` references an aggregation alias.
+            Same op set as filters: eq, neq, gt, gte, lt, lte, in, between (B11).
     """
     if not aggregations:
         raise ValueError("INVALID_FILTER: aggregations is required")
@@ -386,6 +445,7 @@ def query_aggregate(
 
     agg_parts = []
     agg_aliases = []
+    agg_alias_to_expr: dict = {}  # alias → SQL expression (for HAVING substitution)
     for agg in aggregations:
         func = agg.get("function", "").lower()
         col = agg.get("column", "*")
@@ -421,6 +481,7 @@ def query_aggregate(
 
         agg_parts.append(f"{agg_sql} AS {_qcol(alias)}")
         agg_aliases.append(alias)
+        agg_alias_to_expr[alias] = agg_sql
 
     where_sql, params = _build_where(filters or [], schema_columns)
     where_clause = f"WHERE {where_sql}" if where_sql else ""
@@ -443,6 +504,17 @@ def query_aggregate(
         f"{where_clause} {group_sql}"
     )
 
+    # HAVING (B11) — operates on aggregation aliases. We substitute the full
+    # aggregate expression (e.g. COUNT(*)) rather than the alias so HAVING
+    # works even when the alias collides with a source column name.
+    having_clause = ""
+    having_params: list = []
+    if having:
+        having_sql, having_params = _build_having(having, agg_alias_to_expr)
+        if having_sql:
+            having_clause = f" HAVING {having_sql}"
+            sql += having_clause
+
     # ORDER BY
     if order_by:
         direction = "DESC" if order_dir.lower() == "desc" else "ASC"
@@ -456,17 +528,19 @@ def query_aggregate(
 
     sql += f" LIMIT ?"
 
-    # Count total groups
-    count_sql = (
-        f"SELECT COUNT(*) FROM (SELECT 1 FROM rows {where_clause} {group_sql}) AS t"
+    # Count total groups (must include HAVING so total reflects post-filter cardinality)
+    count_inner = (
+        f"SELECT {select_group_cols}{agg_select} FROM rows "
+        f"{where_clause} {group_sql}{having_clause}"
     )
+    count_sql = f"SELECT COUNT(*) FROM ({count_inner}) AS t"
 
     with sqlite3.connect(str(sqlite_path)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA query_only=1")
 
-        total_groups = conn.execute(count_sql, params).fetchone()[0]
-        cursor = conn.execute(sql, params + [limit])
+        total_groups = conn.execute(count_sql, params + having_params).fetchone()[0]
+        cursor = conn.execute(sql, params + having_params + [limit])
 
         groups = []
         for row in cursor:

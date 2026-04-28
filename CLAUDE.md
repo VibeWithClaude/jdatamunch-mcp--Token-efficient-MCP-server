@@ -1,11 +1,11 @@
 # jdatamunch-mcp — Project Brief
 
 ## Current State
-- **Version:** 1.0.0 (Phase A complete — see `todo.md` and CHANGELOG `[1.0.0]`)
+- **Version:** 1.1.0 (Phase B complete — see `todo.md` and CHANGELOG `[1.1.0]`)
 - **GitHub:** `jgravelle/jdatamunch-mcp`
 - **Python:** >=3.10
 - **Index format:** INDEX_VERSION = 2 (v1 → v2 migration registered in `storage/migrations.py`)
-- **Tool count:** 21 (added `validate_index`, `get_dataset_history` in 1.0.0)
+- **Tool count:** 27 (Phase B added `run_sql`, `plan_query`, `get_dataset_health`, `suggest_keys`, `suggest_joins`, `get_distribution`)
 
 ## Key Files
 ```

@@ -4,6 +4,7 @@ import logging
 import time
 from typing import Optional
 
+from ..bm25 import BM25, tokenize
 from ..config import get_index_path, HARD_CAP_SEARCH_MAX_RESULTS
 from ..storage.data_store import DataStore
 from ..storage.token_tracker import get_total_saved
@@ -83,6 +84,25 @@ def _score_column(col: dict, query_lower: str, query_words: set) -> tuple:
         score += _W_TYPE_BOOST
 
     return score, matched_values, match_type
+
+
+def _column_doc_tokens(col: dict) -> list:
+    """Build the BM25 'document' for a column (B9): name + summary + values."""
+    parts: list = []
+    parts.extend(tokenize(col.get("name", "")))
+    parts.extend(tokenize(col.get("ai_summary", "") or ""))
+    if col.get("value_index"):
+        for v in list(col["value_index"].keys())[:50]:
+            parts.extend(tokenize(str(v)))
+    elif col.get("top_values"):
+        for tv in col["top_values"][:50]:
+            parts.extend(tokenize(str(tv.get("value", ""))))
+    if col.get("sample_values"):
+        for v in col["sample_values"][:20]:
+            parts.extend(tokenize(str(v)))
+    if col.get("semantic_type"):
+        parts.append(str(col["semantic_type"]))
+    return parts
 
 
 def _column_text(col: dict) -> str:
@@ -199,9 +219,15 @@ def search_data(
 
     query_lower = query.lower().strip()
     query_words = set(query_lower.split())
+    query_terms = tokenize(query_lower)
+
+    # Pre-build BM25 corpus for the 'all' scope (B9)
+    bm25_index: Optional[BM25] = None
+    if not semantic_only and search_scope == "all" and idx.columns:
+        bm25_index = BM25([_column_doc_tokens(c) for c in idx.columns])
 
     scored: list = []
-    for col in idx.columns:
+    for col_idx, col in enumerate(idx.columns):
         bm25_score = 0.0
         mv: list = []
         mt = "schema"
@@ -238,7 +264,15 @@ def search_data(
                 if bm25_score > 0:
                     mt = "value"
             else:
-                bm25_score, mv, mt = _score_column(col, query_lower, query_words)
+                # 'all' scope: BM25 ranking over name + summary + values (B9),
+                # combined with the legacy weighted score for value-match
+                # provenance + type-aware boosts.
+                legacy_score, mv, mt = _score_column(col, query_lower, query_words)
+                bm25_raw = bm25_index.score(query_terms, col_idx) if bm25_index else 0.0
+                # Scale BM25 into the legacy score range so blending stays sane.
+                bm25_score = legacy_score + bm25_raw * 5.0
+                if bm25_raw > 0 and legacy_score == 0:
+                    mt = "schema"
 
         # Combine scores
         sem = sem_scores.get(col["name"], 0.0) if sem_scores else 0.0

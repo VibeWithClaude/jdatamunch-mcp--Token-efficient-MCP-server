@@ -1,5 +1,64 @@
 # Changelog
 
+## [1.1.0] — Phase B (recommended polish)
+
+Adds the eight Phase-B items from `todo.md`. 301 tests passing. Fully
+backward-compatible — every new capability is additive.
+
+### New tools (B1, B3, B4, B5, B8)
+- **`run_sql`** — read-only sandboxed SQL escape hatch. Accepts a single
+  `SELECT` (or `WITH … SELECT`) over one or more datasets, ATTACHed under
+  schema names. `PRAGMA query_only=1`, 10 s budget, 500-row cap, forbidden-
+  keyword guard. The supported way to express HAVING / window functions /
+  CTEs / multi-way joins that the structured tools don't cover.
+- **`plan_query`** — natural-language intent → ranked tool-call sequence.
+  Pure routing; no LLM call. Built-in intents: summarize, anomalies,
+  compare, join, filter, trend, correlate.
+- **`get_dataset_health`** — composite quality grade (A–F) combining null
+  severity, type-confidence, constant-column count, primary-key presence,
+  semantic-typing coverage, and drift history.
+- **`suggest_keys`** — ranks primary-key candidates with confidence scores
+  and reasons (integer column, UUID format, no nulls, exact-count unique).
+- **`suggest_joins`** — discovers FK candidates by sampling 500 distinct
+  values from each non-PK column and scanning up to 20 other indexed
+  datasets' PK candidates for ≥ 95% containment.
+- **`get_distribution`** — unified bin-counts: numeric → equal-width bins,
+  datetime → time-bucket bins, categorical → top-n + 'other'.
+
+### Existing-tool extensions
+- **`aggregate(having=[…])`** (B11) — post-aggregation filters on aggregation
+  aliases. Supports eq/neq/gt/gte/lt/lte/in/between/is_null. Substitutes
+  the aggregate expression into HAVING so it works even when an alias
+  collides with a source column name.
+- **`get_correlations(method='pearson'|'spearman')`** (B10) — Spearman
+  uses rank-transformed values via SQL window functions, robust to
+  outliers and monotonic non-linear relationships.
+- **`search_data`** (B9) — keyword scoring upgraded to BM25 in the default
+  `all` scope. Documents include column name + ai_summary + value index +
+  semantic_type. Existing schema-only and values-only paths preserved.
+- **`index_local(depth='shallow'|'standard'|'deep')`** (B7) — shallow caps
+  profiling at 100k rows for fast first-look; deep additionally pre-warms
+  the correlation cache.
+
+### Performance / infrastructure
+- **Aggregate result cache** (B2) — `aggregate`, `get_correlations`, and
+  `get_data_hotspots` cache results under `~/.data-index/{dataset}/_cache/`
+  keyed on `(tool, source_hash, normalized_args)`. Invalidated on every
+  re-index. `_meta.cache_hit` reports hit/miss.
+- **Parquet schema pushdown** (B6) — Parquet parser now exposes per-column
+  logical types via `metadata['column_types']`. `index_local` skips the
+  10k-row sample-based type inference when the source already carries
+  authoritative type metadata.
+- **MEMORY journal during ingest** — bulk-load uses `PRAGMA
+  journal_mode=MEMORY` instead of WAL. The tmp file is disposable on crash
+  (A4 invariant), so no on-disk journal is needed; this also clears the
+  Windows rename race that prior WAL sidecars caused.
+
+### Tests
+- 35 new tests across `test_having`, `test_spearman`, `test_bm25`,
+  `test_health_keys_joins`, `test_distribution`, `test_plan_query`,
+  `test_aggregate_cache`, `test_run_sql`, `test_depth`. Total: **301 passing**.
+
 ## [1.0.0] — Phase A complete (V1 closure)
 
 This release completes the Phase A roadmap that earns a stable 1.x.x. The full

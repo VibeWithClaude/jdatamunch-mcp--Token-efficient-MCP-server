@@ -6,6 +6,7 @@ from typing import Optional
 
 from ..config import get_index_path
 from ..storage.data_store import DataStore
+from ..storage import result_cache
 from ..storage.token_tracker import estimate_savings, record_savings, cost_avoided
 
 
@@ -72,6 +73,14 @@ def get_data_hotspots(
     if idx is None:
         return {"error": f"NOT_INDEXED: dataset {dataset!r} is not indexed. Call index_local first."}
 
+    cache_key = result_cache.make_key("get_data_hotspots", idx.source_hash, {"top_n": top_n})
+    cached = result_cache.get(store.dataset_dir(dataset), cache_key)
+    if cached is not None:
+        cached.setdefault("_meta", {})
+        cached["_meta"]["cache_hit"] = True
+        cached["_meta"]["timing_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        return cached
+
     row_count = idx.row_count or 1
     scored = []
 
@@ -125,7 +134,7 @@ def get_data_hotspots(
     tokens_saved = estimate_savings(idx.source_size_bytes, response_bytes)
     total_saved = record_savings(tokens_saved, str(store.base_path))
 
-    return {
+    response = {
         "result": {
             "dataset": dataset,
             "total_columns": len(scored),
@@ -138,6 +147,9 @@ def get_data_hotspots(
             "timing_ms": round((time.perf_counter() - t0) * 1000, 1),
             "tokens_saved": tokens_saved,
             "total_tokens_saved": total_saved,
+            "cache_hit": False,
             **cost_avoided(tokens_saved, total_saved),
         },
     }
+    result_cache.put(store.dataset_dir(dataset), cache_key, response)
+    return response

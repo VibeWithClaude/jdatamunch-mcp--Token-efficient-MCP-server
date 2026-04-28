@@ -18,11 +18,16 @@ from ..config import get_index_path, get_max_rows
 from ..parser import parse_file
 from ..profiler.column_profiler import _ColAcc, update_acc, finalize_profile, infer_types_from_sample, _TYPE_FROM_RANK
 from ..storage.data_store import DataStore
+from ..storage import result_cache
 from ..storage.sqlite_store import create_table, BulkInserter, create_indexes
 from ..storage.token_tracker import record_savings, estimate_savings
 from ..summarizer import summarize_dataset, summarize_column
 
 _TYPE_SAMPLE_ROWS = 10_000  # rows used for preliminary type detection
+
+# Adaptive profiling depth (B7)
+_DEPTHS = ("shallow", "standard", "deep")
+_SHALLOW_ROW_CAP = 100_000  # cap rows profiled in 'shallow' mode
 
 
 def _build_history_snapshot(idx, profiles: list, source_hash: str) -> dict:
@@ -54,10 +59,19 @@ def index_local(
     header_row: int = 0,
     sheet: Optional[str] = None,
     use_ai_summaries: bool = True,
+    depth: str = "standard",
     storage_path: Optional[str] = None,
 ) -> dict:
-    """Index a local CSV / Excel / Parquet / JSONL file. See module docstring."""
+    """Index a local CSV / Excel / Parquet / JSONL file. See module docstring.
+
+    depth (B7):
+      * 'shallow'  — first 100k rows + structural schema only (fastest first look)
+      * 'standard' — full single-pass profile (default)
+      * 'deep'     — standard + correlations precomputed (warmed cache)
+    """
     t0 = time.time()
+    if depth not in _DEPTHS:
+        return {"error": f"INVALID_DEPTH: depth must be one of {_DEPTHS}, got {depth!r}"}
     store = DataStore(base_path=storage_path or str(get_index_path()))
 
     p = Path(path)
@@ -122,16 +136,27 @@ def index_local(
         sample_rows: list = []
         row_iter = parsed.row_iterator
         max_rows = get_max_rows()
-
-        for row in row_iter:
-            sample_rows.append(row)
-            if len(sample_rows) >= _TYPE_SAMPLE_ROWS:
-                break
+        if depth == "shallow":
+            max_rows = min(max_rows, _SHALLOW_ROW_CAP)
 
         accs = [_ColAcc(name=col.name, position=col.position) for col in columns]
-        infer_types_from_sample(accs, sample_rows)
 
-        preliminary_types = [_TYPE_FROM_RANK[acc.type_rank] for acc in accs]
+        # Pushdown (B6): if the parser already knows column types (Parquet),
+        # skip the sample-based inference entirely.
+        pushdown_types: Optional[list] = meta.get("column_types")
+        if pushdown_types and len(pushdown_types) == len(columns):
+            from ..profiler.column_profiler import _TYPE_RANK
+            for acc, t in zip(accs, pushdown_types):
+                acc.type_rank = _TYPE_RANK.get(t, 3)
+            preliminary_types = list(pushdown_types)
+        else:
+            for row in row_iter:
+                sample_rows.append(row)
+                if len(sample_rows) >= _TYPE_SAMPLE_ROWS:
+                    break
+            infer_types_from_sample(accs, sample_rows)
+            preliminary_types = [_TYPE_FROM_RANK[acc.type_rank] for acc in accs]
+
         column_names = [col.name for col in columns]
 
         # --- Phase 2: Create SQLite schema (write to .tmp) ---
@@ -178,20 +203,48 @@ def index_local(
         )
 
         # --- Atomic SQLite swap (A4): only after profiles are ready ---
-        if final_sqlite.exists():
-            try:
-                final_sqlite.unlink()
-            except OSError:
-                pass
-        # WAL/SHM sidecars are safe to leave for SQLite to recreate
-        for ext in (".sqlite-wal", ".sqlite-shm"):
-            sidecar = final_sqlite.with_suffix(ext)
-            if sidecar.exists():
+        # Clean any stale WAL/SHM sidecars on both tmp and final paths.
+        for sidecar_path in (
+            tmp_sqlite.with_name(tmp_sqlite.name + "-wal"),
+            tmp_sqlite.with_name(tmp_sqlite.name + "-shm"),
+            final_sqlite.with_name(final_sqlite.name + "-wal"),
+            final_sqlite.with_name(final_sqlite.name + "-shm"),
+        ):
+            if sidecar_path.exists():
                 try:
-                    sidecar.unlink()
+                    sidecar_path.unlink()
                 except OSError:
                     pass
-        tmp_sqlite.replace(final_sqlite)
+
+        # Force GC of any sqlite Connection objects that may still be
+        # transitioning to closed, then swap. Use copy-then-unlink as a
+        # fallback path — more robust than rename on Windows when a stale
+        # handle is briefly held by AV scanners or the page cache.
+        import gc as _gc
+        import shutil as _shutil
+        import time as _time
+        _gc.collect()
+
+        last_err: Optional[Exception] = None
+        for attempt in range(8):
+            try:
+                if final_sqlite.exists():
+                    final_sqlite.unlink()
+                tmp_sqlite.replace(final_sqlite)
+                last_err = None
+                break
+            except (OSError, PermissionError) as e:
+                last_err = e
+                _time.sleep(0.1 * (attempt + 1))
+        if last_err is not None:
+            # Last-resort: copy bytes, then unlink the tmp. Slower but works
+            # even if the rename can't succeed because Windows still holds a
+            # stale handle on the destination path.
+            try:
+                _shutil.copyfile(str(tmp_sqlite), str(final_sqlite))
+                tmp_sqlite.unlink()
+            except OSError:
+                raise last_err
 
         # --- Phase 7: Save index.json (atomic + sha256 sidecar) ---
         idx = store.save(
@@ -204,6 +257,12 @@ def index_local(
             delimiter=meta.get("delimiter") or "",
             dataset_summary=ds_summary,
         )
+
+        # --- Invalidate cached aggregate results (B2) ---
+        try:
+            result_cache.invalidate(store.dataset_dir(dataset_id))
+        except Exception:
+            pass
 
         # --- Phase 8: Append history snapshot (A8) ---
         try:
@@ -232,6 +291,14 @@ def index_local(
     for p_ in profiles:
         type_counts[p_.type] = type_counts.get(p_.type, 0) + 1
 
+    # Deep mode: precompute correlations to warm the aggregate cache (B7).
+    if depth == "deep":
+        try:
+            from .get_correlations import get_correlations
+            get_correlations(dataset=dataset_id, storage_path=str(store.base_path))
+        except Exception:
+            pass
+
     return {
         "result": {
             "dataset": dataset_id,
@@ -240,6 +307,7 @@ def index_local(
             "columns": n_cols,
             "size_bytes": meta.get("file_size", 0),
             "column_types": type_counts,
+            "depth": depth,
             "indexed_at": idx.indexed_at,
             "duration_seconds": round(duration_s, 1),
         },

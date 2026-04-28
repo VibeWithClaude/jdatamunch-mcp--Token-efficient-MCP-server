@@ -31,6 +31,12 @@ from .tools.embed_dataset import embed_dataset
 from .tools.list_repos import list_repos
 from .tools.validate_index import validate_index
 from .tools.get_dataset_history import get_dataset_history
+from .tools.get_dataset_health import get_dataset_health
+from .tools.suggest_keys import suggest_keys
+from .tools.suggest_joins import suggest_joins
+from .tools.get_distribution import get_distribution
+from .tools.plan_query import plan_query
+from .tools.run_sql import run_sql
 from .budget import enforce_budget
 from .call_tracker import record_call
 
@@ -80,6 +86,12 @@ async def list_tools() -> list[Tool]:
                     "sheet": {
                         "type": "string",
                         "description": "Excel sheet name to index (default: first sheet)",
+                    },
+                    "depth": {
+                        "type": "string",
+                        "enum": ["shallow", "standard", "deep"],
+                        "description": "Profiling depth (B7). 'shallow' caps at 100k rows for fast first-look; 'standard' is the full profile (default); 'deep' additionally precomputes correlations.",
+                        "default": "standard",
                     },
                 },
                 "required": ["path"],
@@ -325,6 +337,11 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "object"},
                         "description": "Pre-filter rows before aggregating (same syntax as get_rows)",
                     },
+                    "having": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": "Post-aggregation filter on aggregation aliases (B11). Each item: {\"column\": <alias>, \"op\": eq|neq|gt|gte|lt|lte|in|between|is_null, \"value\": ...}",
+                    },
                     "order_by": {"type": "string", "description": "Column or alias to sort by"},
                     "order_dir": {
                         "type": "string",
@@ -454,6 +471,12 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "description": "Max pairs to return (default 20, max 200)",
                         "default": 20,
+                    },
+                    "method": {
+                        "type": "string",
+                        "enum": ["pearson", "spearman"],
+                        "description": "Correlation method (default 'pearson'). Spearman is rank-based — robust to outliers and monotonic non-linear relationships (B10).",
+                        "default": "pearson",
                     },
                 },
                 "required": ["dataset"],
@@ -639,6 +662,126 @@ async def list_tools() -> list[Tool]:
                 "required": ["dataset"],
             },
         ),
+        Tool(
+            name="get_dataset_health",
+            description=(
+                "Composite quality grade (A–F) for a dataset (B4). Combines "
+                "null severity, type-confidence, constant-column count, "
+                "primary-key presence, semantic-typing coverage, and drift "
+                "history into a single score with a structured breakdown."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset": {"type": "string", "description": "Dataset identifier"},
+                },
+                "required": ["dataset"],
+            },
+        ),
+        Tool(
+            name="suggest_keys",
+            description=(
+                "Rank primary-key candidates for a dataset (B5). Each entry "
+                "carries a confidence score plus the reasons that raised it "
+                "(integer column, UUID format, no nulls, exact-count unique)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset": {"type": "string", "description": "Dataset identifier"},
+                },
+                "required": ["dataset"],
+            },
+        ),
+        Tool(
+            name="suggest_joins",
+            description=(
+                "Discover FK candidates between this dataset and other "
+                "indexed datasets (B5). For each non-PK column in the source, "
+                "scans up to 20 other datasets' PK candidates and proposes "
+                "joins where containment ≥ 95%. Sample-based (500 distinct "
+                "values per source column)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset": {"type": "string", "description": "Source dataset identifier"},
+                },
+                "required": ["dataset"],
+            },
+        ),
+        Tool(
+            name="get_distribution",
+            description=(
+                "Unified bin-counts for any column type (B8). Numeric → "
+                "equal-width bins between min/max; datetime → time-bucket "
+                "bins; categorical / string → top-n + 'other' bucket. "
+                "Token-cheap way to ask 'what does this column look like?'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset": {"type": "string", "description": "Dataset identifier"},
+                    "column": {"type": "string", "description": "Column name"},
+                    "bins": {
+                        "type": "integer",
+                        "description": "Number of bins / categories to return (default 20, max 100)",
+                        "default": 20,
+                    },
+                },
+                "required": ["dataset", "column"],
+            },
+        ),
+        Tool(
+            name="plan_query",
+            description=(
+                "Map a natural-language intent into a ranked tool-call "
+                "sequence for the given dataset (B3). Pure routing — no LLM "
+                "call. Built-in intents: summarize, anomalies, compare, "
+                "join, filter, trend, correlate."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dataset": {"type": "string", "description": "Dataset identifier"},
+                    "intent": {
+                        "type": "string",
+                        "description": "Natural-language intent (e.g. 'summarize', 'find anomalies', 'join with X', 'trend over time'). Default 'summarize'.",
+                        "default": "summarize",
+                    },
+                },
+                "required": ["dataset"],
+            },
+        ),
+        Tool(
+            name="run_sql",
+            description=(
+                "Read-only sandboxed SQL escape hatch (B1). Accepts a single "
+                "SELECT (or WITH … SELECT) statement. The first dataset is "
+                "the main connection; additional datasets are ATTACHed under "
+                "schema names (e.g. `<dataset>.rows`). Statement runs under "
+                "PRAGMA query_only=1 with a 10-second budget and 500-row cap. "
+                "Use this for HAVING / window functions / CTEs / multi-way "
+                "joins that the structured tools don't cover."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "SELECT or WITH … SELECT statement"},
+                    "datasets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Indexed datasets to attach. Order matters: datasets[0] is the main connection.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Row cap (default 500, hard max 500)",
+                        "default": 500,
+                    },
+                },
+                "required": ["sql", "datasets"],
+            },
+        ),
     ]
 
 
@@ -682,6 +825,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 header_row=arguments.get("header_row", 0),
                 sheet=arguments.get("sheet"),
                 use_ai_summaries=arguments.get("use_ai_summaries", True),
+                depth=arguments.get("depth", "standard"),
                 storage_path=storage_path,
             )
         elif name == "index_repo":
@@ -741,6 +885,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 aggregations=arguments["aggregations"],
                 group_by=arguments.get("group_by"),
                 filters=arguments.get("filters"),
+                having=arguments.get("having"),
                 order_by=arguments.get("order_by"),
                 order_dir=arguments.get("order_dir", "desc"),
                 limit=arguments.get("limit", 50),
@@ -782,6 +927,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 min_abs_correlation=arguments.get("min_abs_correlation", 0.3),
                 columns=arguments.get("columns"),
                 top_n=arguments.get("top_n", 20),
+                method=arguments.get("method", "pearson"),
                 storage_path=storage_path,
             )
         elif name == "join_datasets":
@@ -823,6 +969,44 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = get_dataset_history(
                 dataset=arguments["dataset"],
                 n=arguments.get("n", 10),
+                storage_path=storage_path,
+            )
+        elif name == "get_dataset_health":
+            result = get_dataset_health(
+                dataset=arguments["dataset"],
+                storage_path=storage_path,
+            )
+        elif name == "suggest_keys":
+            result = suggest_keys(
+                dataset=arguments["dataset"],
+                storage_path=storage_path,
+            )
+        elif name == "suggest_joins":
+            result = await asyncio.to_thread(
+                suggest_joins,
+                dataset=arguments["dataset"],
+                storage_path=storage_path,
+            )
+        elif name == "get_distribution":
+            result = await asyncio.to_thread(
+                get_distribution,
+                dataset=arguments["dataset"],
+                column=arguments["column"],
+                bins=arguments.get("bins", 20),
+                storage_path=storage_path,
+            )
+        elif name == "plan_query":
+            result = plan_query(
+                dataset=arguments["dataset"],
+                intent=arguments.get("intent", "summarize"),
+                storage_path=storage_path,
+            )
+        elif name == "run_sql":
+            result = await asyncio.to_thread(
+                run_sql,
+                sql=arguments["sql"],
+                datasets=arguments["datasets"],
+                limit=arguments.get("limit", 500),
                 storage_path=storage_path,
             )
         else:

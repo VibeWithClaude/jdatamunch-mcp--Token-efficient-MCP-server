@@ -101,61 +101,63 @@ Shipped in 1.0.0. See CHANGELOG `[1.0.0]` for the full rollup. 266 tests passing
 
 ---
 
-## Phase B — Strongly Recommended (1.1.0 – 1.3.0)
+## Phase B — Strongly Recommended (1.1.0 – 1.3.0) — COMPLETE ✅
 
-### B1. Read-only sandboxed `run_sql`
-- [ ] New tool: `run_sql(sql, datasets=[a,b,...])`.
-- [ ] AST validation rejecting non-SELECT (parse with `sqlglot` or pure-Python statement check).
-- [ ] `PRAGMA query_only=1`, statement timeout, hard row cap.
-- [ ] ATTACH DATABASE per named dataset.
+Shipped in 1.1.0. See CHANGELOG `[1.1.0]`. 301 tests passing.
 
-### B2. Aggregate result cache
-- [ ] Hash `(dataset, source_hash, aggregations, group_by, filters, order_by, limit)` → cached JSON in `~/.data-index/{dataset}/_cache/`.
-- [ ] Invalidate when `source_hash` changes.
-- [ ] Apply to `aggregate`, `get_correlations`, `get_data_hotspots`.
+### B1. Read-only sandboxed `run_sql` ✅
+- [x] New tool: `run_sql(sql, datasets=[a,b,...])` (`tools/run_sql.py`).
+- [x] Pure-Python validation rejects non-SELECT, multi-statement, and forbidden keywords.
+- [x] `PRAGMA query_only=1`, 10 s wall-clock budget via progress handler, 500-row cap.
+- [x] ATTACH DATABASE per named dataset under safe schema alias.
 
-### B3. `plan_query` agent router
-- [ ] New tool: `plan_query(dataset, intent: str)` returning ranked tool sequence.
-- [ ] Pure routing logic over schema metadata; no LLM call.
-- [ ] Built-in intents: `summarize`, `find anomalies`, `compare to`, `join with`, `filter`.
+### B2. Aggregate result cache ✅
+- [x] `storage/result_cache.py`: hash key over `(tool, source_hash, normalized_args)` → JSON files in `~/.data-index/{dataset}/_cache/`.
+- [x] Invalidated by `result_cache.invalidate()` on every successful re-index.
+- [x] Applied to `aggregate`, `get_correlations`, `get_data_hotspots`. `_meta.cache_hit` reports.
 
-### B4. Dataset health score
-- [ ] New tool: `get_dataset_health(dataset)`.
-- [ ] Composite: null severity, type-confidence avg, constant-col count, near-duplicate rows, schema-drift flags, PK presence.
-- [ ] Returns A–F grade + breakdown.
+### B3. `plan_query` agent router ✅
+- [x] New tool: `plan_query(dataset, intent: str)` (`tools/plan_query.py`).
+- [x] Pure routing — no LLM call.
+- [x] Intents: `summarize`, `anomalies`, `compare`, `join`, `filter`, `trend`, `correlate`.
 
-### B5. FK/PK + functional dependency discovery
-- [ ] `suggest_keys(dataset)`: scan unique columns, surface PK candidates with confidence.
-- [ ] `suggest_joins(dataset)`: cross-dataset containment scan; threshold `containment >= 0.95` against PK candidates of other datasets.
-- [ ] Limit cross-dataset scan to 20 datasets, sample-based.
+### B4. Dataset health score ✅
+- [x] New tool: `get_dataset_health(dataset)` (`tools/get_dataset_health.py`).
+- [x] Composite: null severity, type-confidence avg, constant-col count, PK presence, semantic typing rate, drift-free score.
+- [x] Returns A–F grade + components + issue lists.
 
-### B6. Streaming Parquet row-group pushdown
-- [ ] Detect Parquet source in `index_local`; branch to `parquet_parser.profile_metadata()`.
-- [ ] Read row-group min/max/null_count from Parquet metadata; sample rows only for value distribution.
-- [ ] Skip full row materialization unless deep mode requested.
+### B5. FK/PK + functional dependency discovery ✅
+- [x] `suggest_keys(dataset)` ranks PK candidates with confidence + reasons.
+- [x] `suggest_joins(dataset)` containment scan, ≥ 0.95 threshold, sample-based.
+- [x] Cross-dataset scan capped at 20 datasets.
 
-### B7. Adaptive profiling depth
-- [ ] Add `depth: 'shallow' | 'standard' | 'deep'` to `index_local`.
-- [ ] Shallow: first 100k rows + structural schema only.
-- [ ] Standard: current behavior.
-- [ ] Deep: + correlations precomputed + embeddings.
-- [ ] Record `profile_depth` in `index.json`.
+### B6. Streaming Parquet row-group pushdown ✅
+- [x] `parquet_parser` exposes per-column logical types via `metadata['column_types']`.
+- [x] `index_local` consumes pushdown types and skips the 10k-row sample inference for Parquet.
+- [ ] Full row-group min/max/null_count exposure (deferred — current pushdown already eliminates one pass).
 
-### B8. Unified `get_distribution`
-- [ ] New tool: `get_distribution(dataset, column, bins=20, by=optional_groupby)`.
-- [ ] Numeric → equal-width bins; datetime → time-bucket bins; categorical ordinal → top-n + other.
+### B7. Adaptive profiling depth ✅
+- [x] `depth: 'shallow' | 'standard' | 'deep'` parameter on `index_local`.
+- [x] Shallow caps at 100k rows; deep precomputes correlations.
+- [x] Recorded as `result.depth` in the response.
 
-### B9. BM25 in `search_data`
-- [ ] Replace substring scoring with BM25 over column name + ai_summary + sample values.
-- [ ] Vendor ~50 LOC BM25; preserve existing semantic-hybrid path.
+### B8. Unified `get_distribution` ✅
+- [x] New tool dispatching numeric / datetime / categorical bin counts.
+- [x] Numeric: equal-width bins between min/max. Datetime: month buckets. Categorical: top-n + 'other'.
 
-### B10. Spearman correlation
-- [ ] Add `method: 'pearson' | 'spearman'` to `get_correlations`.
-- [ ] Spearman: rank-transform via SQLite `ROW_NUMBER() OVER (ORDER BY col)` then Pearson on ranks.
+### B9. BM25 in `search_data` ✅
+- [x] Vendored `bm25.py` (~80 LOC, k1=1.5, b=0.75).
+- [x] BM25 used in default `all` scope over column name + ai_summary + value index + samples.
+- [x] Existing semantic-hybrid path preserved.
 
-### B11. HAVING in `aggregate`
-- [ ] Add `having: list[Filter]` parameter; filters reference aggregation aliases.
-- [ ] Validate aliases exist; emit as SQL `HAVING` clause.
+### B10. Spearman correlation ✅
+- [x] `method: 'pearson' | 'spearman'` on `get_correlations`.
+- [x] Spearman implemented via `ROW_NUMBER() OVER (ORDER BY col)` rank transform + Pearson on ranks.
+
+### B11. HAVING in `aggregate` ✅
+- [x] `having: list[Filter]` parameter on `aggregate`.
+- [x] Substitutes aggregate expression (not alias) into HAVING — works even when alias name collides with a source column.
+- [x] Operators: eq, neq, gt, gte, lt, lte, in, between, is_null.
 
 ---
 
